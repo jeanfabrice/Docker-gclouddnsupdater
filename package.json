@@ -1,0 +1,13 @@
+{
+  "name": "gclouddnsupdater",
+  "version": "2.2.2",
+  "description": "",
+  "main": "index.js",
+  "author": "Jean-Fabrice BOBO",
+  "license": "MIT",
+  "dependencies": {
+    "@google-cloud/dns": "^5.3.1",
+    "@kubernetes/client-node": "^1.4.0",
+    "node-unifi": "^2.5.1"
+  }
+}
