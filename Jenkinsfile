@@ -10,7 +10,7 @@ void sendMail( String r ) {
   subject += ' ${JOB_NAME} #${BUILD_NUMBER}'
   body = 'See <${BUILD_URL}display/redirect>'
   if (r != 'SUCCESS') {
-    body += "\n\n--------------------------\n" + currentBuild.rawBuild.getLog(500).join("\n")
+    body += "\n\nView full logs at: ${BUILD_URL}console"
   }
   withCredentials([string(credentialsId: 'jenkins-admin-email', variable: 'EMAIL')]) {
     emailext body: body, subject: subject, to: env.EMAIL
