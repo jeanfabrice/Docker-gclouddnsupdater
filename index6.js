@@ -96,7 +96,7 @@ async function updateK8sService(namespace, serviceName, newIp) {
 
     if (currentVal === newVal) {
       console.log(`[Kubernetes] Service ${namespace}/${serviceName} up-to-date.`);
-      return;
+      return false;
     }
 
     const patchPayload = {
@@ -117,11 +117,13 @@ async function updateK8sService(namespace, serviceName, newIp) {
     );
 
     console.log(`[Kubernetes] Service ${namespace}/${serviceName} updated: ${lbAnnotationKey} = ${newVal}`);
+    return { updated: true, oldValue: currentVal || '(none)', newValue: newVal };
   } catch (err) {
     const errMsg = err.response ? JSON.stringify(err.response.body) : err.message;
     const logMsg = `[Kubernetes] Error while updating ${namespace}/${serviceName}: ${errMsg}`;
     console.error(logMsg);
     await sendWebhook(`Kubernetes Error (${namespace}/${serviceName}): ${errMsg}`);
+    return false;
   }
 }
 
@@ -153,7 +155,7 @@ async function updateK8sMetalLBPool(namespace, poolName, prefixBytes, suffixStr)
 
     if (currentIpv6 === newIpv6Network) {
       console.log(`[MetalLB] IPAddressPool ${poolName} up-to-date.`);
-      return;
+      return false;
     }
 
     const newAddresses = ipv4Range ? [ipv4Range, newIpv6Network] : [newIpv6Network];
@@ -177,17 +179,19 @@ async function updateK8sMetalLBPool(namespace, poolName, prefixBytes, suffixStr)
     );
 
     console.log(`[MetalLB] IPAddressPool ${poolName} updated: ${newIpv6Network}`);
+    return { updated: true, oldValue: currentIpv6 ?? '(none)', newValue: newIpv6Network };
   } catch (err) {
     const errMsg = err.response ? JSON.stringify(err.response.body) : err.message;
     console.error(`[MetalLB] Error while updating ${poolName}:`, errMsg);
     await sendWebhook(`Kubernetes Error (${poolName}): ${errMsg}`);
+    return false;
   }
 }
 
 // ---------- UniFi Logic ----------
 
 async function updateUnifiFirewall(groupName, newIp) {
-  if (!unifiConfig.host || !unifiConfig.username) return;
+  if (!unifiConfig.host || !unifiConfig.username) return false;
 
   const unifi = new Unifi.Controller({
     host: unifiConfig.host,
@@ -206,13 +210,15 @@ async function updateUnifiFirewall(groupName, newIp) {
       const msg = `[UniFi] Unknown firewall group: ${groupName}`;
       console.error(msg);
       await sendWebhook(msg);
-      return;
+      return false;
     }
 
     if (targetGroup.group_members.includes(newIp) && targetGroup.group_members.length === 1) {
       console.log(`[UniFi] Firewall group ${groupName} up-to-date.`);
-      return;
+      return false;
     }
+
+    const oldIp = targetGroup.group_members.join(',') || '(none)';
 
     await unifi.editFirewallGroup(
       targetGroup._id,
@@ -222,12 +228,14 @@ async function updateUnifiFirewall(groupName, newIp) {
       [newIp]
     );
 
-    console.log(`[UniFi] Firewall group ${groupName} updated: ${newIp}`);
+    console.log(`[UniFi] Firewall group ${groupName} updated: ${oldIp} -> ${newIp}`);
     await unifi.logout();
+    return { updated: true, oldValue: oldIp, newValue: newIp };
   } catch (err) {
     const logMsg = `[UniFi] Error while updating ${groupName}: ${err.message}`;
     console.error(logMsg);
     await sendWebhook(logMsg);
+    return false;
   }
 }
 
@@ -357,12 +365,12 @@ async function updateOrCreate(zone, name, type, value) {
       const newRec = zone.record(type.toLowerCase(), { name, data: value, ttl: rec.ttl || 60 });
       await zone.replaceRecords(rec.type, newRec);
       console.log(`[DNS] Updated ${type} ${name}: ${existing} -> ${value}`);
-      return true;
+      return { updated: true, oldValue: existing, newValue: value };
     } else {
       const newRec = zone.record(type.toLowerCase(), { name, data: value, ttl: 60 });
       await zone.addRecords(newRec);
       console.log(`[DNS] Created ${type} ${name}: ${value}`);
-      return true;
+      return { updated: true, oldValue: null, newValue: value };
     }
   } catch (err) {
     const logMsg = `[DNS] DNS Error ${name} ${type}: ${err.message}`;
@@ -392,8 +400,9 @@ async function updateOrCreate(zone, name, type, value) {
           const names = process.env.GCLOUD_DNS_NAME.split(',').map(s => s.trim()).filter(Boolean);
           for (const raw of names) {
             const name = ensureTrailingDot(raw);
-            if (await updateOrCreate(zone, name, 'A', ipv4)) {
-              changed.push(`${name} A -> ${ipv4}`);
+            const result = await updateOrCreate(zone, name, 'A', ipv4);
+            if (result && result.updated) {
+              changed.push(`DNS ${name} A: ${result.oldValue ?? '(new)'} -> ${result.newValue}`);
             }
           }
         }
@@ -414,7 +423,10 @@ async function updateOrCreate(zone, name, type, value) {
 
           // 1. Mise à jour des pools MetalLB (Portion /64)
           for (const p of metallbPools) {
-            await updateK8sMetalLBPool(p.ns, p.pool, prefixBytes, p.suffix);
+            const metallbResult = await updateK8sMetalLBPool(p.ns, p.pool, prefixBytes, p.suffix);
+            if (metallbResult && metallbResult.updated) {
+              changed.push(`MetalLB Pool ${p.ns}/${p.pool}: ${metallbResult.oldValue} -> ${metallbResult.newValue}`);
+            }
           }
 
           // 2. Boucle par domaine (DNS, UniFi, K8s Services)
@@ -432,20 +444,27 @@ async function updateOrCreate(zone, name, type, value) {
               const finalIp = bytesToIpv6(finalBytes);
 
               // 2.1. DNS
-              if (await updateOrCreate(zone, name, 'AAAA', finalIp)) {
-                changed.push(`${name} AAAA -> ${finalIp}`);
+              const dnsResult = await updateOrCreate(zone, name, 'AAAA', finalIp);
+              if (dnsResult && dnsResult.updated) {
+                changed.push(`DNS ${name} AAAA: ${dnsResult.oldValue ?? '(new)'} -> ${dnsResult.newValue}`);
               }
 
               // 2.2. UniFi Firewall
               const unifiGroupName = unifiMapping[name];
               if (unifiGroupName) {
-                await updateUnifiFirewall(unifiGroupName, finalIp);
+                const unifiResult = await updateUnifiFirewall(unifiGroupName, finalIp);
+                if (unifiResult && unifiResult.updated) {
+                  changed.push(`UniFi Firewall ${unifiGroupName}: ${unifiResult.oldValue} -> ${unifiResult.newValue}`);
+                }
               }
 
               // 2.3. Kubernetes Service
               const kInfo = k8sMapping[name];
               if (kInfo) {
-                await updateK8sService(kInfo.ns, kInfo.svc, finalIp);
+                const k8sResult = await updateK8sService(kInfo.ns, kInfo.svc, finalIp);
+                if (k8sResult && k8sResult.updated) {
+                  changed.push(`K8s Service ${kInfo.ns}/${kInfo.svc}: ${k8sResult.oldValue} -> ${k8sResult.newValue}`);
+                }
               }
             } catch (err) {
               console.error(`Error AAAA ${entry}:`, err.message);
